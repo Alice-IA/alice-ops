@@ -71,7 +71,14 @@ services:
     labels:
       # Watchtower solo toca contenedores con esta etiqueta.
       com.centurylinklabs.watchtower.enable: "true"
-      alice.instance: ${USER_NAME}
+      # Identidad del sandbox para el Sandbox Manager: GET /provision/orphans
+      # filtra por alice.jobId. Las tres son obligatorias (sin ellas compose
+      # no arranca): el manager las pasa por entorno al provisionar.
+      alice.jobId: ${ALICE_JOB_ID:?falta ALICE_JOB_ID}
+      alice.userId: ${ALICE_USER_ID:?falta ALICE_USER_ID}
+      alice.sandboxId: ${ALICE_SANDBOX_ID:?falta ALICE_SANDBOX_ID}
+      # Etiqueta humana (no identifica el sandbox; puede ir vacía).
+      alice.instance: ${USER_NAME:-}
 
 volumes:
   letta-state:

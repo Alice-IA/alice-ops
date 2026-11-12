@@ -10,13 +10,36 @@ Manager**: stdout solo lleva JSON, los logs van por stderr.
 
 ```
 nodes/_ejemplo.env          topología del nodo (ws/wss, puerto, host)
-instances/_ejemplo.env      datos por instancia (USER_NAME, ALICE_SANDBOX_ID, LETTA_TAG, hash, LiteLLM)
+instances/_ejemplo.env      datos por instancia (USER_NAME, ALICE_JOB_ID, ALICE_USER_ID, ALICE_SANDBOX_ID, LETTA_TAG, hash, LiteLLM)
 docker-compose.yml          servicio por instancia, sin `ports:`
 docker-compose.watchtower.yml
-scripts/deploy.sh           deploy: <user> | --all | --list [--node <nodo>] [--json]
+scripts/deploy.sh           deploy: <instancia> | --all | --list [--node <nodo>] [--json]
+                            sin <instancia>: modo manager, toma todo del entorno
 scripts/fake-docker.sh      doble de docker para tests sin Docker
 tests/deploy-test.sh        contrato de deploy.sh (nodo, transporte, JSON)
 ```
+
+## Cambios respecto a la versión inicial
+
+- **El puerto ya no se publica.** El contenedor vive en la red externa
+  `sandboxes` (`name: ${SANDBOX_NETWORK:-sandboxes}`) y el gateway lo alcanza
+  por DNS interno (`alice-<ALICE_SANDBOX_ID>:4500`) o por el túnel del nodo.
+- **El token no vive en el contenedor.** El contenedor guarda solo su
+  `sha256` (`--ws-token-sha256`); el token en claro está cifrado en PostgreSQL.
+- **`--ws-token-sha256` no está en docs.letta.com.** Solo existe en el
+  binario; por eso `LETTA_TAG` nunca es `latest` (sin rollback).
+- **Contrato `deploy.sh --json`.** stdout solo JSON: `results[]` con
+  `sandboxId`, `containerName`, `internalHost`, `port`, `transport` y
+  `containerId`. Exit 0 ok, 1 fallo de ejecución (`DEPLOY_FAILED`,
+  `READY_TIMEOUT`), 2 input inválido (`INVALID_INPUT`).
+- **Precedencia de entorno.** Lo que exporta el manager (`ALICE_JOB_ID`,
+  `ALICE_USER_ID`, `ALICE_SANDBOX_ID`, `WS_TOKEN_SHA256`) gana sobre
+  `instances/*.env`; sin `<instancia>` deploy.sh funciona solo con el entorno.
+- **El hash se calcula sobre el STRING base64url** que viaja en
+  `Authorization: Bearer`, no sobre los 32 bytes crudos.
+- **Verificación pendiente en el host:**
+  `docker run --rm letta/letta:0.34.39 sh -c 'which node; node -v'`; si falta
+  `node`, usar la variante `wget` como fallback.
 
 ## Identidad del sandbox
 
@@ -33,7 +56,7 @@ Manager). Para el nombre del contenedor no se usa `USER_NAME`:
   `internalHost = "alice-<ALICE_SANDBOX_ID>"`.
 
 `USER_NAME` se conserva como etiqueta humana (`alice.instance`) y no identifica
-al sandbox. `deploy.sh` fija el proyecto Compose con `-p alice-<instancia>`.
+al sandbox. `deploy.sh` fija el proyecto Compose con `-p alice-<ALICE_SANDBOX_ID>`.
 
 ## Topología del nodo (`nodes/`)
 
@@ -86,6 +109,10 @@ printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1   # -> WS_TOKEN_SHA256
 ./scripts/deploy.sh alice-123 --node vps-1
 ./scripts/deploy.sh alice-123 --node vps-1 --json
 ./scripts/deploy.sh --list
+
+# modo manager (sin instancia): todo por entorno; el entorno GANA sobre el .env
+ALICE_JOB_ID=... ALICE_USER_ID=... ALICE_SANDBOX_ID=... WS_TOKEN_SHA256=... \
+  ./scripts/deploy.sh --node vps-1 --json
 ```
 
 Actualizar una instancia = cambiar `LETTA_TAG` en su `.env` y
@@ -104,7 +131,7 @@ por **stdout** es solo JSON; `docker compose`, avisos y errores de ejecución va
 por **stderr**.
 
 ```json
-{"ok":true,"results":[{"ok":true,"instance":"alice-123","containerId":"3f2a...","internalHost":"alice-7f3c2a1b","port":4500,"transport":"ws"}]}
+{"ok":true,"results":[{"ok":true,"sandboxId":"7f3c2a1b","containerName":"alice-7f3c2a1b","internalHost":"alice-7f3c2a1b","port":4500,"transport":"ws","containerId":"3f2a..."}]}
 ```
 
 Si una instancia falla, el array trae el fallo y el proceso sale con 1. El
@@ -112,8 +139,8 @@ contenedor **no** se borra: decide el manager (reintento y cleanup).
 
 ```json
 {"ok":false,"results":[
-  {"ok":true,"instance":"alice-123","containerId":"3f2a...","internalHost":"alice-7f3c2a1b","port":4500,"transport":"ws"},
-  {"ok":false,"instance":"alice-124","code":"READY_TIMEOUT","message":"sin respuesta en /readyz tras 90s","containerId":"9b1c..."}
+  {"ok":true,"sandboxId":"7f3c2a1b","containerName":"alice-7f3c2a1b","internalHost":"alice-7f3c2a1b","port":4500,"transport":"ws","containerId":"3f2a..."},
+  {"ok":false,"sandboxId":"9b1c4d2e","containerName":"alice-9b1c4d2e","code":"READY_TIMEOUT","message":"sin respuesta en /readyz tras 90s","containerId":"9b1c..."}
 ]}
 ```
 
@@ -177,6 +204,9 @@ interpolación del compose (`SANDBOX_NETWORK`).
 
 - El contenedor **no** monta el token. Recibe solo su digest:
   `--ws-token-sha256 <64 hex>`.
+- El hash se calcula sobre el **string base64url** del token (lo que viaja en
+  `Authorization: Bearer`), no sobre los 32 bytes crudos. Si el backend hashea
+  bytes, el handshake falla aunque el token sea correcto.
 - `--ws-auth capability-token` sigue siendo obligatorio: el flag del hash **no**
   reemplaza al modo de auth, y es mutuamente excluyente con `--ws-token-file`.
 - El token en claro vive cifrado en PostgreSQL (backend). `alice-ops` nunca lo
@@ -250,8 +280,11 @@ bash tests/deploy-test.sh
 
 No requieren Docker: usan `scripts/fake-docker.sh`. Cubren selección de nodo
 (0/1/2 nodos, `--node` vs `NODE_ID`, inexistente), `ws`/`wss`, defaults de
-puerto, `ALICE_SANDBOX_ID` obligatorio y único (container_name), `LETTA_TAG=latest`,
-`INVALID_INPUT`, `READY_TIMEOUT` y la forma del JSON.
+puerto, `ALICE_JOB_ID`/`ALICE_USER_ID`/`ALICE_SANDBOX_ID` obligatorios,
+`ALICE_SANDBOX_ID` único (container_name), hash vacío/no-hex/mayúsculas,
+`LETTA_TAG=latest`, precedencia del entorno del manager sobre el `.env`,
+`INVALID_INPUT`, `READY_TIMEOUT`, `DEPLOY_FAILED`, la forma de `results[]`
+(`sandboxId`/`containerName`) y el contrato estático de `docker-compose.yml`.
 
 ## Lo que NO resuelve
 

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# deploy.sh — despliegue idempotente de una o todas las instancias de Alice.
+# deploy.sh — despliegue idempotente de un sandbox de Alice.
 #
-#   ./scripts/deploy.sh juan --node vps-1          # crea/actualiza la instancia juan
+#   ./scripts/deploy.sh juan --node vps-1          # instancia de instances/juan.env
 #   ./scripts/deploy.sh --all --node vps-1         # todas las de instances/*.env
-#   ./scripts/deploy.sh --node vps-1 --json        # salida máquina-legible
+#   ./scripts/deploy.sh --node vps-1 --json        # modo manager (solo entorno)
 #   ./scripts/deploy.sh --list                     # estado de cada instancia
 #
 # Idempotente: si nada cambió, `up -d` no recrea el contenedor.
 #
 # Topología: nodes/<nodo>.env (SANDBOX_TRANSPORT, SANDBOX_PORT,
-# SANDBOX_PUBLIC_HOST, SANDBOX_NETWORK). Se selecciona con --node, o con
-# NODE_ID; si no hay ninguno y existe exactamente un nodes/*.env, se usa ese.
+# SANDBOX_PUBLIC_HOST, SANDBOX_NETWORK). Se selecciona con --node o NODE_ID;
+# si no hay ninguno y existe exactamente un nodes/*.env, se usa ese.
+#
+# Precedencia: las variables del invocador (el Sandbox Manager) GANAN sobre
+# instances/<instancia>.env. En modo manager no hace falta instancia: toma
+# ALICE_JOB_ID, ALICE_USER_ID, ALICE_SANDBOX_ID y WS_TOKEN_SHA256 del entorno.
 #
 # Códigos de salida:
 #   0  todo bien
@@ -30,9 +34,11 @@ NODE_FLAG=""
 TARGETS=()
 RESULTS=()
 FAILED=0
+ENV_MODE=0
+SEEN_IDS=""
 node_file=""
 
-# Detectar --json antes de parsear: un error temprano también debe ser JSON.
+# --json se detecta antes de parsear: un error temprano también debe ser JSON.
 for arg in "$@"; do
   if [ "$arg" = "--json" ]; then JSON=1; fi
 done
@@ -79,17 +85,9 @@ Opciones:
   --ready-timeout <s>  Timeout de /readyz en segundos (default 90).
   -h, --help           Esta ayuda.
 
-Variables de entorno:
-  READY_CHECK_CMD      Comando de readiness ejecutado en el host. Recibe
-                       DOCKER y CONTAINER_NAME. Default: docker exec <c>
-                       node -e "fetch('http://127.0.0.1:4500/readyz')...".
-                       Útil si la imagen no trae node (ver README).
-
-Topología (nodes/<id>.env):
-  SANDBOX_TRANSPORT=ws|wss     obligatoria
-  SANDBOX_PORT=4500|443        default 4500 (ws) / 443 (wss)
-  SANDBOX_PUBLIC_HOST=<host>   vacío = nombre del contenedor (solo ws)
-  SANDBOX_NETWORK=sandboxes    opcional
+Modo manager (sin <instancia>): toma ALICE_JOB_ID, ALICE_USER_ID,
+ALICE_SANDBOX_ID y WS_TOKEN_SHA256 del entorno; esas variables GANAN sobre
+instances/*.env. Sin instancia ni ALICE_SANDBOX_ID: error de uso.
 EOF
 }
 
@@ -136,7 +134,44 @@ case "$READY_TIMEOUT" in
 esac
 [ "$READY_TIMEOUT" -gt 0 ] || invalid "--ready-timeout debe ser un entero positivo"
 
-# Lista de instancias desplegables: instances/*.env excluyendo los _plantilla.
+if [ "$ACTION" = "list" ] && [ "$JSON" -eq 1 ]; then
+  invalid "--json no se combina con --list"
+fi
+
+# El manager exporta estas variables antes de invocar deploy.sh. Se capturan
+# aquí para re-aplicarlas DESPUÉS de cargar instances/*.env: el invocador gana.
+_INV_JOB="${ALICE_JOB_ID:-}"
+_INV_USER="${ALICE_USER_ID:-}"
+_INV_SANDBOX="${ALICE_SANDBOX_ID:-}"
+_INV_HASH="${WS_TOKEN_SHA256:-}"
+_INV_TAG="${LETTA_TAG:-}"
+_INV_LITELLM_URL="${LITELLM_BASE_URL:-}"
+_INV_LITELLM_KEY="${LITELLM_API_KEY:-}"
+_INV_USER_NAME="${USER_NAME:-}"
+
+apply_invoker() {
+  if [ -n "$_INV_JOB" ]; then export ALICE_JOB_ID="$_INV_JOB"; fi
+  if [ -n "$_INV_USER" ]; then export ALICE_USER_ID="$_INV_USER"; fi
+  if [ -n "$_INV_SANDBOX" ]; then export ALICE_SANDBOX_ID="$_INV_SANDBOX"; fi
+  if [ -n "$_INV_HASH" ]; then export WS_TOKEN_SHA256="$_INV_HASH"; fi
+  if [ -n "$_INV_TAG" ]; then export LETTA_TAG="$_INV_TAG"; fi
+  if [ -n "$_INV_LITELLM_URL" ]; then export LITELLM_BASE_URL="$_INV_LITELLM_URL"; fi
+  if [ -n "$_INV_LITELLM_KEY" ]; then export LITELLM_API_KEY="$_INV_LITELLM_KEY"; fi
+  if [ -n "$_INV_USER_NAME" ]; then export USER_NAME="$_INV_USER_NAME"; fi
+  return 0
+}
+
+read_env() {
+  local file="$1" name="$2"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$file" >/dev/null 2>&1 || true
+    printf '%s' "${!name:-}"
+  )
+}
+
+# Lista de instancias desplegables: instances/*.env excluyendo las _plantilla.
 list_instances() {
   local f
   for f in instances/*.env; do
@@ -156,8 +191,8 @@ node_list() {
   printf '%s' "$list"
 }
 
-# --node gana sobre NODE_ID. Si no hay ninguno: exactamente un nodes/*.env
-# (con aviso por stderr); 0 o >=2 es INVALID_INPUT.
+# --node gana sobre NODE_ID. Sin ninguno: exactamente un nodes/*.env (con
+# aviso); 0 o >=2 es INVALID_INPUT.
 select_node() {
   local -a files=()
   local f id
@@ -236,67 +271,101 @@ validate_topology() {
   if [ "$SANDBOX_TRANSPORT" = "ws" ] && [ -n "$SANDBOX_PUBLIC_HOST" ]; then
     warn "SANDBOX_PUBLIC_HOST='$SANDBOX_PUBLIC_HOST' con SANDBOX_TRANSPORT=ws: es legal (p. ej. LB interno), pero revisa que sea intencional"
   fi
+
+  SANDBOX_NETWORK="${SANDBOX_NETWORK:-sandboxes}"
+  export SANDBOX_TRANSPORT SANDBOX_PORT SANDBOX_PUBLIC_HOST SANDBOX_NETWORK
 }
 
-read_env() {
-  local file="$1" name="$2"
-  (
-    set -a
-    # shellcheck disable=SC1090
-    . "$file" >/dev/null 2>&1 || true
-    printf '%s' "${!name:-}"
-  )
+# Carga un instances/*.env y vuelve a aplicar el entorno del invocador.
+load_instance() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    invalid "no existe $file"
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$file"
+  set +a
+  apply_invoker
 }
 
-validate_targets() {
-  local t f user hash tag sandbox_id sandbox_key seen_ids=""
+# Valida la instancia efectiva (archivo + entorno ya fusionados).
+validate_instance() {
+  local sid="${ALICE_SANDBOX_ID:-}"
+  if [ -z "$sid" ]; then
+    invalid "falta ALICE_SANDBOX_ID (id único de la fila containers)"
+  fi
+  case "$sid" in
+    -*) invalid "ALICE_SANDBOX_ID inválido ('$sid'): no puede empezar por '-'" ;;
+    *[!A-Za-z0-9_.-]*) invalid "ALICE_SANDBOX_ID inválido ('$sid'): solo [A-Za-z0-9_.-]" ;;
+  esac
+
+  if [ -z "${ALICE_JOB_ID:-}" ]; then
+    invalid "falta ALICE_JOB_ID (label alice.jobId)"
+  fi
+  if [ -z "${ALICE_USER_ID:-}" ]; then
+    invalid "falta ALICE_USER_ID (label alice.userId)"
+  fi
+
+  local hash="${WS_TOKEN_SHA256:-}"
+  if [[ ! "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    invalid "WS_TOKEN_SHA256 debe ser 64 hex (SHA-256 del capability token)"
+  fi
+  export WS_TOKEN_SHA256="${hash,,}"
+
+  local tag="${LETTA_TAG:-}"
+  if [ -z "$tag" ]; then
+    invalid "falta LETTA_TAG"
+  fi
+  if [ "${tag,,}" = "latest" ]; then
+    invalid "LETTA_TAG no puede ser 'latest' (sin rollback)"
+  fi
+
+  if [ -z "${LITELLM_BASE_URL:-}" ]; then
+    invalid "falta LITELLM_BASE_URL"
+  fi
+  if [ -z "${LITELLM_API_KEY:-}" ]; then
+    invalid "falta LITELLM_API_KEY"
+  fi
+}
+
+# Valida todas las instancias antes de tocar docker: no queremos desplegar
+# media flota y fallar a la mitad por un input inválido.
+prepare_targets() {
+  local t sid
+  SEEN_IDS=""
   for t in "${TARGETS[@]}"; do
-    f="instances/$t.env"
-    [ -f "$f" ] || invalid "no existe $f"
-
-    user="$(read_env "$f" USER_NAME)"
-    [ -n "$user" ] || invalid "$f: falta USER_NAME"
-    case "$user" in
-      *[!A-Za-z0-9_.-]*|.*) invalid "$f: USER_NAME inválido ('$user')" ;;
+    load_instance "instances/$t.env"
+    validate_instance
+    sid="${ALICE_SANDBOX_ID,,}"
+    case " $SEEN_IDS " in
+      *" $sid "*) invalid "ALICE_SANDBOX_ID '$ALICE_SANDBOX_ID' repetido; container_name debe ser único por sandbox" ;;
     esac
-
-    sandbox_id="$(read_env "$f" ALICE_SANDBOX_ID)"
-    [ -n "$sandbox_id" ] || invalid "$f: falta ALICE_SANDBOX_ID (id único de la fila containers)"
-    case "$sandbox_id" in
-      *[!A-Za-z0-9_.-]*|.*|-*) invalid "$f: ALICE_SANDBOX_ID inválido ('$sandbox_id')" ;;
-    esac
-    # Docker compara container_name sin distinguir mayúsculas.
-    sandbox_key="${sandbox_id,,}"
-    case " $seen_ids " in
-      *" $sandbox_key "*) invalid "$f: ALICE_SANDBOX_ID '$sandbox_id' repetido; container_name debe ser único por sandbox" ;;
-    esac
-    seen_ids+=" $sandbox_key"
-
-    hash="$(read_env "$f" WS_TOKEN_SHA256)"
-    if [[ ! "$hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
-      invalid "$f: WS_TOKEN_SHA256 debe ser 64 hex (SHA-256 del capability token)"
-    fi
-
-    tag="$(read_env "$f" LETTA_TAG)"
-    [ -n "$tag" ] || invalid "$f: falta LETTA_TAG"
-    if [ "${tag,,}" = "latest" ]; then
-      invalid "$f: LETTA_TAG no puede ser 'latest' (sin rollback)"
-    fi
+    SEEN_IDS+=" $sid"
   done
 }
 
-run_compose() {
-  local user="$1" envfile="$2"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "  [dry-run] $DOCKER compose -p alice-$user --env-file $node_file --env-file $envfile up -d --remove-orphans"
-    return 0
+add_success() {
+  local sid="$1" cname="$2" host="$3" cid="$4"
+  RESULTS+=("$(printf '{"ok":true,"sandboxId":"%s","containerName":"%s","internalHost":"%s","port":%s,"transport":"%s","containerId":"%s"}' \
+    "$(json_escape "$sid")" "$(json_escape "$cname")" "$(json_escape "$host")" \
+    "$SANDBOX_PORT" "$SANDBOX_TRANSPORT" "$(json_escape "$cid")")")
+}
+
+add_failure() {
+  local sid="$1" cname="$2" code="$3" msg="$4" cid="$5"
+  FAILED=1
+  RESULTS+=("$(printf '{"ok":false,"sandboxId":"%s","containerName":"%s","code":"%s","message":"%s","containerId":"%s"}' \
+    "$(json_escape "$sid")" "$(json_escape "$cname")" "$(json_escape "$code")" \
+    "$(json_escape "$msg")" "$(json_escape "$cid")")")
+}
+
+docker_container_id() {
+  local container="$1" id=""
+  if [ "$DRY_RUN" -eq 0 ]; then
+    id="$("$DOCKER" inspect -f '{{.Id}}' "$container" 2>/dev/null || true)"
   fi
-  # En --json, todo lo que no sea el JSON final va a stderr.
-  if [ "$JSON" -eq 1 ]; then
-    "$DOCKER" compose -p "alice-$user" --env-file "$node_file" --env-file "$envfile" up -d --remove-orphans 1>&2
-  else
-    "$DOCKER" compose -p "alice-$user" --env-file "$node_file" --env-file "$envfile" up -d --remove-orphans
-  fi
+  printf '%s' "${id:-$container}"
 }
 
 ready_check() {
@@ -307,7 +376,6 @@ ready_check() {
     DOCKER="$DOCKER" CONTAINER_NAME="$container" bash -c "$READY_CHECK_CMD" >/dev/null 2>&1
   else
     # /readyz dentro del contenedor: la imagen garantiza node (no curl/wget).
-    # AbortSignal.timeout evita que un fetch colgado bloquee el poll.
     "$DOCKER" exec "$container" node -e "fetch('http://127.0.0.1:4500/readyz',{signal:AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1
   fi
 }
@@ -322,65 +390,41 @@ wait_ready() {
   done
 }
 
-docker_container_id() {
-  local container="$1" id=""
-  if [ "$DRY_RUN" -eq 0 ]; then
-    id="$("$DOCKER" inspect -f '{{.Id}}' "$container" 2>/dev/null || true)"
-  fi
-  printf '%s' "${id:-$container}"
-}
-
-add_success() {
-  local user="$1" endpoint="$2" cid="$3"
-  RESULTS+=("$(printf '{"ok":true,"instance":"%s","containerId":"%s","internalHost":"%s","port":%s,"transport":"%s"}' \
-    "$(json_escape "$user")" "$(json_escape "$cid")" "$(json_escape "$endpoint")" "$SANDBOX_PORT" "$SANDBOX_TRANSPORT")")
-}
-
-add_failure() {
-  local user="$1" code="$2" msg="$3" cid="$4"
-  FAILED=1
-  RESULTS+=("$(printf '{"ok":false,"instance":"%s","code":"%s","message":"%s","containerId":"%s"}' \
-    "$(json_escape "$user")" "$(json_escape "$code")" "$(json_escape "$msg")" "$(json_escape "$cid")")")
-}
-
 deploy_one() {
-  local target="$1" envfile="instances/$1.env"
-  local sandbox_id container endpoint cid
-
-  sandbox_id="$(read_env "$envfile" ALICE_SANDBOX_ID)"
-  container="alice-${sandbox_id}"
-
-  # El .env de la instancia manda sobre el entorno del host: docker compose
-  # interpola con prioridad el shell, y no queremos que un USER_NAME,
-  # ALICE_SANDBOX_ID, WS_TOKEN_SHA256 o LITELLM_API_KEY global pise los de
-  # esta instancia.
-  export USER_NAME="$(read_env "$envfile" USER_NAME)"
-  export ALICE_SANDBOX_ID="$sandbox_id"
-  export LETTA_TAG="$(read_env "$envfile" LETTA_TAG)"
-  export WS_TOKEN_SHA256="$(read_env "$envfile" WS_TOKEN_SHA256)"
-  export LITELLM_BASE_URL="$(read_env "$envfile" LITELLM_BASE_URL)"
-  export LITELLM_API_KEY="$(read_env "$envfile" LITELLM_API_KEY)"
-
-  log "==> $target ($envfile)"
-
-  if ! run_compose "$target" "$envfile"; then
-    warn "$target: docker compose up falló"
-    add_failure "$target" "DEPLOY_FAILED" "docker compose up falló" "$(docker_container_id "$container")"
-    return 1
+  local sandbox_id="$1" envfile="$2"
+  local container="alice-${sandbox_id}"
+  local cid
+  local -a compose_args=(compose -p "alice-${sandbox_id}" --env-file "$node_file")
+  if [ -n "$envfile" ]; then
+    compose_args+=(--env-file "$envfile")
   fi
+  compose_args+=(up -d --remove-orphans)
 
-  if [ "$DRY_RUN" -eq 0 ] && [ "$WAIT_READY" -eq 1 ]; then
-    if ! wait_ready "$container"; then
-      warn "$target: READY_TIMEOUT (sin /readyz en ${READY_TIMEOUT}s)"
-      add_failure "$target" "READY_TIMEOUT" "sin respuesta en /readyz tras ${READY_TIMEOUT}s" "$(docker_container_id "$container")"
+  log "==> ${sandbox_id}${envfile:+ ($envfile)}"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "  [dry-run] $DOCKER ${compose_args[*]}"
+  else
+    if [ "$JSON" -eq 1 ]; then
+      if ! "$DOCKER" "${compose_args[@]}" 1>&2; then
+        add_failure "$sandbox_id" "$container" "DEPLOY_FAILED" "docker compose up falló" "$(docker_container_id "$container")"
+        return 1
+      fi
+    else
+      if ! "$DOCKER" "${compose_args[@]}"; then
+        add_failure "$sandbox_id" "$container" "DEPLOY_FAILED" "docker compose up falló" "$(docker_container_id "$container")"
+        return 1
+      fi
+    fi
+
+    if [ "$WAIT_READY" -eq 1 ] && ! wait_ready "$container"; then
+      add_failure "$sandbox_id" "$container" "READY_TIMEOUT" "sin respuesta en /readyz tras ${READY_TIMEOUT}s" "$(docker_container_id "$container")"
       return 1
     fi
   fi
 
-  endpoint="${SANDBOX_PUBLIC_HOST:-$container}"
   cid="$(docker_container_id "$container")"
-  add_success "$target" "$endpoint" "$cid"
-  [ "$JSON" -eq 1 ] || log "    endpoint ${SANDBOX_TRANSPORT}://${endpoint}:${SANDBOX_PORT}"
+  add_success "$sandbox_id" "$container" "${SANDBOX_PUBLIC_HOST:-$container}" "$cid"
   return 0
 }
 
@@ -389,11 +433,10 @@ DOCKER="${DOCKER_BIN:-docker}"
 
 case "$ACTION" in
   list)
-    [ "$JSON" -eq 0 ] || invalid "--json no se combina con --list"
     for local_user in $(list_instances); do
+      sid="$(read_env "instances/$local_user.env" ALICE_SANDBOX_ID)"
       printf '%-20s ' "$local_user"
-      label_user="$(read_env "instances/$local_user.env" USER_NAME)"
-      "$DOCKER" ps --filter "label=alice.instance=${label_user:-$local_user}" \
+      "$DOCKER" ps --filter "label=alice.sandboxId=${sid}" \
         --format '{{.Status}}\t{{.Image}}' 2>/dev/null | head -1 || echo "(sin contenedor)"
     done
     exit 0
@@ -404,18 +447,30 @@ case "$ACTION" in
     [ "${#TARGETS[@]}" -gt 0 ] || invalid "no hay instances/*.env (excluyendo _plantilla)"
     ;;
   deploy)
-    [ "${#TARGETS[@]}" -gt 0 ] || invalid "uso: $0 <instancia>|--all|--list [--node <nodo>] [--json]"
+    if [ "${#TARGETS[@]}" -eq 0 ]; then
+      if [ -n "${ALICE_SANDBOX_ID:-}" ]; then
+        ENV_MODE=1
+      else
+        invalid "uso: $0 <instancia>|--all|--list [--node <nodo>] [--json]"
+      fi
+    fi
     ;;
 esac
 
 select_node
 validate_topology
-validate_targets
 
-# Evita desplegar media flota y fallar a la mitad por un input inválido.
-for t in "${TARGETS[@]}"; do
-  deploy_one "$t" || true
-done
+if [ "$ENV_MODE" -eq 1 ]; then
+  validate_instance
+  deploy_one "$ALICE_SANDBOX_ID" "" || true
+else
+  prepare_targets
+  for t in "${TARGETS[@]}"; do
+    load_instance "instances/$t.env"
+    validate_instance
+    deploy_one "$ALICE_SANDBOX_ID" "instances/$t.env" || true
+  done
+fi
 
 if [ "$JSON" -eq 1 ]; then
   results_json=""
@@ -433,8 +488,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
   echo
   echo "==> Estado"
   for t in "${TARGETS[@]}"; do
-    label_user="$(read_env "instances/$t.env" USER_NAME)"
-    "$DOCKER" ps --filter "label=alice.instance=${label_user:-$t}" --format "{{.Names}}\t{{.Status}}\t{{.Image}}" || true
+    sid="$(read_env "instances/$t.env" ALICE_SANDBOX_ID)"
+    "$DOCKER" ps --filter "label=alice.sandboxId=${sid}" --format "{{.Names}}\t{{.Status}}\t{{.Image}}" || true
   done
 fi
 
