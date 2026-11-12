@@ -1,0 +1,85 @@
+# Un solo servicio por sandbox.
+# Uso:  ./scripts/deploy.sh <instancia> --node <nodo>   (ver nodes/_ejemplo.env)
+#       ./scripts/deploy.sh --all --node <nodo>
+#
+# Instancia: instances/<instancia>.env · Topología: nodes/<nodo>.env
+# La imagen NO se fija aquí: se fija en instances/<instancia>.env con LETTA_TAG.
+# Motivo: con `latest` no hay rollback. Si una versión rompe algo, no sabes a qué volver.
+
+name: alice-${USER_NAME}
+
+services:
+  letta:
+    image: letta/letta:${LETTA_TAG:?LETTA_TAG es obligatorio, ej. 0.34.39}
+    # Único por sandbox (id de la fila `containers`), no por usuario:
+    # dos re-provisions del mismo USER_NAME no deben chocar en el host Docker.
+    container_name: alice-${ALICE_SANDBOX_ID:?falta ALICE_SANDBOX_ID}
+    restart: unless-stopped
+    # Sin `ports:`: ningún contenedor de usuario publica en el host.
+    # El gateway lo alcanza por DNS interno dentro de la red `sandboxes`
+    # (nombre del contenedor) o por el túnel, según la topología del nodo.
+    networks:
+      - sandboxes
+    volumes:
+      # El estado NO se comparte entre instancias: LETTA_LOCAL_BACKEND_DIR es por proceso,
+      # así que cada instancia necesita su propio volumen o todos ven la misma memoria.
+      - letta-state:/root/.letta
+      - letta-workspace:/workspace
+      # Sin secreto montado: el contenedor solo recibe el HASH del token
+      # (--ws-token-sha256). El token en claro vive cifrado en PostgreSQL.
+
+    environment:
+      # ============================================================
+      # LiteLLM via API OpenAI-compatible (verificado en el bundle).
+      #
+      #   protocol_v2.d.ts: "Explicit effort for an OpenAI-compatible proxy"
+      #   model_handle ejemplo del propio tipo: "anthropic/claude-sonnet-4-6"
+      #   OpenAI SDK: baseURL = readEnv("OPENAI_BASE_URL")
+      #
+      # El titular del token es el AGENTE, no un humano con shell aparte:
+      # el contenedor es la jaula. Riesgo real = fuga por prompt injection,
+      # no robo por el usuario. Acotado por budget/modelos de la virtual key.
+      #
+      # CUIDADO: la config persistida del proveedor gana sobre la env var
+      # (config.base_url ?? readEnv(...)). Si el agente tuvo un /connect o
+      # update_model con su propia URL, OPENAI_BASE_URL se ignora y se va
+      # a api.openai.com -> 401 sin pista. Alternativa robusta:
+      # connect_provider + update_model con model_handle explícito.
+      # ============================================================
+      OPENAI_BASE_URL: ${LITELLM_BASE_URL:?falta LITELLM_BASE_URL}
+      OPENAI_API_KEY: ${LITELLM_API_KEY:?falta LITELLM_API_KEY}
+      LETTA_LOCAL_BACKEND_DIR: /root/.letta/lc-local-backend
+    command: >
+      letta server
+      --backend local
+      --listen ws://0.0.0.0:4500
+      --ws-auth capability-token
+      --ws-token-sha256 ${WS_TOKEN_SHA256:?falta WS_TOKEN_SHA256}
+    healthcheck:
+      # /readyz responde 200 sin auth y sin Origin cuando el App Server está listo.
+      # node está garantizado en la imagen (letta/letta instala letta-code con npm);
+      # no dependemos de curl/wget.
+      test:
+        - CMD
+        - node
+        - "-e"
+        - "fetch('http://127.0.0.1:4500/readyz',{signal:AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    labels:
+      # Watchtower solo toca contenedores con esta etiqueta.
+      com.centurylinklabs.watchtower.enable: "true"
+      alice.instance: ${USER_NAME}
+
+volumes:
+  letta-state:
+  letta-workspace:
+
+networks:
+  # Red compartida por el gateway y todos los sandboxes del host.
+  # Debe existir antes del deploy: docker network create sandboxes
+  sandboxes:
+    external: true
+    name: ${SANDBOX_NETWORK:-sandboxes}

@@ -1,0 +1,7 @@
+instances/*.env
+!instances/_ejemplo.env
+nodes/*.env
+!nodes/_ejemplo.env
+secrets/*
+!secrets/.keep
+*.log

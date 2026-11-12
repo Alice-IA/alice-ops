@@ -1,0 +1,24 @@
+# Actualización automática de imágenes, separado del compose de usuarios.
+# Levantar: docker compose -f docker-compose.watchtower.yml up -d
+#
+# ADVERTENCIA: Watchtower monta el socket de Docker => equivale a root en el host.
+# Súbelo con usuario no privilegiado y grupo docker (ver scripts/endurecer-watchtower.md).
+
+name: alice-watchtower
+
+services:
+  watchtower:
+    image: containrrr/watchtower:1.7.1   # también él con tag fijo
+    container_name: alice-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"        # solo contenedores etiquetados
+      WATCHTOWER_CLEANUP: "true"             # borra imágenes viejas (ojo con disco de 20 GB)
+      WATCHTOWER_ROLLING_RESTART: "true"     # una instancia a la vez, no todas de golpe
+      WATCHTOWER_SCHEDULE: "0 0 4 * * *"     # diario 04:00
+      WATCHTOWER_STOP_TIMEOUT: "60s"         # dar tiempo a cerrar conversaciones en vuelo
+      # WATCHTOWER_MONITOR_ONLY: "true"  # descomentar para solo notificar, sin actualizar
+      # WATCHTOWER_NOTIFICATIONS: "telegram"
+      # WATCHTOWER_NOTIFICATION_TELEGRAM_... (token via secret)
